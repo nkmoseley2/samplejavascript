@@ -1,0 +1,1835 @@
+[% USE JSON ( convert_blessed => 1 ) %]
+
+<script type="text/javascript">
+
+var service_types = [% service_types.json %];
+
+/* Glabal variables filled in by init */
+var rest_api;
+var cfopal_store;
+var cfopal_dataStore;
+var identity_store;
+var liaison_store;
+var netid_store;
+var org_store;
+var org_dataStore;
+var service_grid;
+var service_store;
+var service_role_store;
+var service_type_store;
+var service_type_role_store;
+var service_user_store;
+var service_user_role_store;
+var service_dialog_standby;
+
+/* Constants */
+var service_dialog_width = 570;
+
+/* Global variables to track page state */
+var current_dialog;
+var current_dialog_init;
+var current_service_type;
+var current_service;
+var current_service_properties;
+var current_service_roles;
+var current_service_user_store;
+var current_service_user_grid;
+var next_service_dialog_message;
+
+require([
+    "dojo/aspect",              "dojo/dom",
+    "dojo/dom-construct",       "dojo/on",
+    "dojo/parser",              "dojo/ready",
+    "dijit/registry", 
+    "dojo/store/Memory",
+    "dojox/widget/Standby",
+    "uic/api/rest/Interface",
+
+    /* Items needed to parse dojo elements in HTML */
+    "dijit/Dialog",                "dijit/Toolbar",
+    "dijit/form/Button",           "dijit/form/CheckBox",
+    "dijit/form/ComboBox",         "dijit/form/CurrencyTextBox",
+    "dijit/form/FilteringSelect",  "dijit/form/Form",
+    "dijit/form/Select",           "dijit/form/TextBox",  
+    "dijit/form/Textarea",         "dijit/form/ValidationTextBox",
+    "dijit/layout/ContentPane",
+    "dojox/grid/DataGrid"
+], function(
+    aspect,                     dom,
+    domConstruct,               on,
+    parser,                     ready,
+    registry,
+    MemoryStore,
+    Standby,
+    uicRestAPI
+){ ready( function() {
+
+    rest_api = new uicRestAPI({
+        'url' : '[% c.uri_for('/rest') %]'
+    });
+
+    window.rest_api.init(function() {
+        // Convenience global variables for stores.
+	cfopal_store            = rest_api.stores['CFOPAL'];
+        cfopal_dataStore        = rest_api.dataStores['CFOPAL'];
+        identity_store          = rest_api.stores['Identity'];
+        liaison_store           = rest_api.stores['Liaison'];
+        netid_store             = rest_api.stores['NetID'];
+        org_store               = rest_api.stores['Org'];
+        org_dataStore           = rest_api.dataStores['Org'];
+        service_store           = rest_api.stores['Service'];
+        service_role_store      = rest_api.stores['ServiceRole'];
+        service_type_store      = rest_api.stores['ServiceType'];
+        service_type_role_store = rest_api.stores['ServiceTypeRole'];
+        service_user_store      = rest_api.stores['ServiceUser'];
+        service_user_role_store = rest_api.stores['ServiceUserRole'];
+
+        // Init a memory store to cache user information for services
+        current_service_user_store = new MemoryStore({});
+
+        // Set the size of the grid container to match the window size.
+        // The data grid will be created and placed inside this div.
+        var viewport_size = dojo.window.getBox();
+	var gridContainerDiv = dom.byId("gridContainerDiv");
+	gridContainerDiv.style.height = (viewport_size.h - 50)+'px';
+	gridContainerDiv.style.marginBottom = '30px';
+
+	service_grid = window.rest_api.makeDataGrid({
+	    'noDataMessage' : "No services found.",
+            'query' : { status: ['requested','pending','live','suspended'] },
+	    'objectType' : "Service",
+	    'onRowDblClick' : function (e) {
+		var item = e.grid.getItem(e.rowIndex);
+	        openEditServiceDialog( item.id );
+	    },
+	    'sortInfo' : 1,
+	    'structure' : [{
+		'name' :   "Service",
+		'fields' : ['service_type->name','name'],
+		'formatter' : function (args) {
+		    return args.join(' - ');
+		},
+		'width' : "auto"
+	    },{
+		'name' :  "Owner",
+		'field' : "owner->display_name",
+		'width' : "320px",
+		'formatter' : function (cfopal) {
+                    if( cfopal ) {
+		        return cfopal;
+		    } else {
+			return '-';
+		    }
+		}
+	    },{
+		'name' :  "CFOPAL",
+		'field' : "cfopal->cfopal",
+		'width' : "190px",
+		'formatter' : function (cfopal) {
+                    if( cfopal ) {
+		        return cfopal;
+		    } else {
+			return '-';
+		    }
+		}
+	    },{
+		'name' :  "Monthly Charge",
+		'field' : "monthly_charge",
+		'formatter' : function (charge) {
+                    if( charge ) {
+		        return "$"+charge.toFixed(2);
+		    } else {
+			return '-';
+		    }
+		},
+		'headerStyles' : "text-align: left; width: 100px;",
+		'styles' : "text-align: right; width: 100px;",
+		'width' : "100px"
+	    },{
+		'name' :  "Status",
+		'field' : "status",
+		'width' : "120px"
+	    }]
+	},domConstruct.create('div'));
+
+require(["dojo/query", "dojo/NodeList-dom", "dojo/domReady!"], function(query){   query("#hiddenitems").style("display", "none"); });
+
+	// Pre-populate the Fopal cache for the filter combobox
+	cfopal_store.query({status:'active'},{});
+
+	// Enable all widgets in grid toolbar after fetch completes
+	aspect.after(service_grid,"_onFetchComplete", function() {
+	    setTimeout(function() {
+		var toolbar = registry.byId("service_grid_toolbar");
+		var toolbarWidgets = toolbar.getChildren();
+		for(var i=0; i < toolbarWidgets.length; ++i){
+		    var widget = toolbarWidgets[i];
+		    widget.set("disabled",false);
+		}
+	    }, 200 );
+	});
+	dojo.place(service_grid.domNode,gridContainerDiv);
+	service_grid.startup();
+
+	// Now finish up loading everything...
+	parser.parse().then(function() { 
+	    gridContainerDiv.style.display = "block";
+
+            // Add the standby for dialogs, can't do this declaratively for some reason.
+            service_dialog_standby = new Standby({
+                zindex: 1000,
+                target: service_dialog.domNode
+            }).placeAt( document.body );
+
+	    // Check if a particular service instance is specified in the URL hash portion
+	    if( location.hash ) {
+		var matches;
+		if( matches = location.hash.match(/id=(\d+)/)) {
+		    openEditServiceDialog( matches[1] );
+		} else if( matches = location.hash.match(/#(\w+):(.*)/) ) {
+		    var table_name = matches[1];
+		    var name = matches[2];
+		    service_store.query({
+			"service_type->table_name" : table_name,
+			"name" : name
+		    },{}).then( function( siRes ) {
+                        if( siRes.length > 0 ) {
+		            openEditServiceDialog( matches[1].id );
+                        }
+		    } );
+		}
+	    }
+	});
+    }); // rest_api.init
+
+})}); // require -> ready
+
+require(["dojo/io-query"], function(ioQuery) {
+window.service_grid_download = function()
+{
+    var url = service_store.target.replace(/\/$/,".csv") + '?' + ioQuery.objectToQuery( service_grid.query );
+    window.open( url );
+}});
+
+
+// Function to handle changes in the query for the main page grid.
+require(["dijit/registry"], function(registry) {
+window.service_grid_refresh = function ()
+{
+    // Disable all widgets in grid toolbar before beginning a fetch
+    var toolbar = registry.byId("service_grid_toolbar");
+    var toolbarWidgets = toolbar.getChildren();
+    for(var i=0; i < toolbarWidgets.length; ++i){
+        var widget = toolbarWidgets[i];
+        widget.set("disabled",true);
+    }
+
+    var query = {};
+    var service_type_id = registry.byId("serviceTypeFilter").getValue();
+    if( service_type_id ) {
+        query.service_type_id = service_type_id;
+    }
+
+    var name = registry.byId("serviceNameFilter").getValue();
+    if( name ) {
+        query.name = '*'+name+'*';
+    }
+
+    var org_name = registry.byId("orgFilter").getValue();
+    if( org_name ) {
+        query['owner->org->description'] = '*'+org_name+'*';
+    }
+
+    var cfopal = registry.byId("cfopalFilter").getValue();
+    if( cfopal ) {
+        query['cfopal->cfopal'] = cfopal+'*';
+    }
+
+    var monthly_charge_filter = registry.byId("monthly_chargeFilter").getValue();
+    if( monthly_charge_filter == "free" ) {
+        query.monthly_charge = '0';
+    } else if( monthly_charge_filter == "billing" ) {
+        query['monthly_charge:{">":0}'] = '';
+    }
+
+    var status = registry.byId("statusFilter").getValue();
+    if( status ) {
+        query.status = status.split(',');
+    }
+
+    service_grid.setQuery(query);
+}});
+
+
+/*
+ * Translate the service_type_id into an object then continue.
+ */
+require(["dojo/when"], function(when) {
+window.openAddServiceDialog = function( service_type_id )
+{
+    when( service_type_store.get(service_type_id), function(service_type) {
+        service_type_role_store.query({ service_type_id: service_type_id }).then( function(roles) {
+            __openAddServiceDialog( service_type, roles );
+        });
+    } );
+}});
+
+
+/*
+ * Open add service dialog
+ */
+require(["dojo/dom","dijit/registry"], function(dom,registry) {
+window.__openAddServiceDialog = function( service_type, roles )
+{
+    /* Record that we're showing the service_dialog so that functions like
+     * recalculate_charges() can find the correct inputs.
+     */
+    current_dialog = "add";
+    current_dialog_init = true;
+    current_service_type = service_type;
+    current_service = {
+        'owner_id': null,
+        'service_type_id': service_type.id,
+        'cfopal_id': null,
+        'name': '',
+        'monthly_charge': 0, // Will be recalculated...
+        'monthly_charge_override': null,
+        'setup_charge': 0, // Will be recalculated...
+        'setup_charge_override': null,
+        'status': 'requested',
+        'rtid': null,
+        'user_liaison_type_id': service_type.default_user_liaison_type_id,
+        'admin_liaison_type_id': service_type.default_admin_liaison_type_id,
+        'description': ''
+    };
+    current_service_properties = {};
+    current_service_roles = roles;
+
+    /* Init user store to empty list for new service.
+     */
+    current_service_user_store.setData([]);
+
+    /* Hide standby if active.
+     */
+    service_dialog_standby.hide();
+
+    /* Set service type specific text in add dialog.
+     */
+    service_dialog.set('title','Create '+service_type.name);
+    registry.byId('service_dialog_submitButton').set('label','Create '+service_type.name);
+
+    /* Set appropriate options for new service
+     */
+    registry.byId("service_dialog_statusInput").set( 'options', [{
+        label: "Requested", value: "requested"
+    },{
+        label: "Pending", value: "pending"
+    },{
+        label: "Live", value: "live"
+    }]);
+
+    /* Do all the standard service dialog init stuff
+     */
+    service_dialog_init();
+
+    /* Now show the dialog
+     */
+    service_dialog.show();
+    resize_dialog( service_dialog );
+    current_service_user_grid.startup();
+}});
+
+
+/* Run clean-up and get all the service related data before passing to
+ * __openEditServiceDialog(...)
+ */
+require(["dojo/when","dojo/promise/all","dojo/Deferred"], function(when,all,Deferred) {
+window.openEditServiceDialog = function( service_id )
+{
+    // Re-get item from store before opening the dialog.
+    service_store.query({ 'id' : service_id },{}).then( function( res ) {
+        if( res.length != 1 )
+            throw new Error("Failed to retrieve service id "+service_id);
+        var service = res[0];
+
+        
+        when( service_type_store.get(service.service_type_id), function(service_type) {
+
+            /* Now that we have the basic service data we can make additional
+             * queries for the rest of it. We want these queries to run
+             * simultaneously, so we collect a list of promises to do so.
+             */
+	    var promises = {};
+
+            /* Get the service type specific properties.
+             */
+            var properties_store = rest_api.stores['Service_'+service_type.table_name];
+            promises.properties = properties_store.query({ 'id' : service.id });
+
+            /* Get the owner Identity and and owner object. In the case that
+             * the service is owned by an Org, this should be the Org identity
+             * and the Org itself. In the case of a Person it would be the
+             * Person's Identity and then the Person.
+             */
+            var owner_deferred = new Deferred();
+            promises.owner = owner_deferred.promise;
+            identity_store.query({ 'id' : service.owner_id }).then( function( res ) {
+                if( res.length != 1 )
+                    throw new Error("Failed to rerieve owner identity for service id "+service_id);
+                var identity = res[0];
+
+                switch( identity.type ) {
+                    case 'org':
+                        when( org_store.get( identity.id ), function(org) {
+                            org.id = identity.id; // Ideally the id property would be done by the REST api
+                            owner_deferred.resolve( [ identity, org ] );
+                        });
+                        break;
+                    case 'person':
+                        when( person_store.get( identity.id ), function(person) {
+                            person.id = identity.id; // Ideally the id property would be done by the REST api
+                            owner_deferred.resolve( [ identity, person ] );
+                        });
+                        break;
+                    default:
+                        throw new Error("Invalid owner type '"+identity.type+"' for service id "+service_id);
+                }
+            });
+
+            /* Get the service users and user_roles.
+             */
+            promises.users      = service_user_store.query({ service_id: service.id, '-cols': '*,netid->netid' });
+            promises.user_roles = service_user_role_store.query({ service_id: service.id });
+
+            /* Get list of roles available for this service.
+             */
+            promises.roles = service_role_store.query({ service_id: service.id },{ sort: [{ attribute: 'order' }] });
+
+            all(promises).then(function(results){
+                var properties = results.properties[0];
+                var owner_identity = results.owner[0];
+                var owner = results.owner[1];
+                var users = combine_users_and_roles( results.users, results.user_roles );
+                var roles = results.roles;
+
+                __openEditServiceDialog( service_type, service, properties, owner_identity, owner, users, roles );
+            });
+        });
+    });
+}});
+
+
+// Put the user role data into the users.
+function combine_users_and_roles ( users, user_roles )
+{
+    var users_by_netid = {};
+    for( var i in users ) {
+        users[i].deleted = false;
+        users_by_netid[ users[i].netid_id ] = users[i];
+    }
+
+    for( var i in user_roles ) {
+        users_by_netid[ user_roles[i].netid_id ][ 'role_'+user_roles[i].service_role_id ] = true;
+        users_by_netid[ user_roles[i].netid_id ][ 'role_'+user_roles[i].service_role_id+'_init' ] = true;
+    }
+    return users;
+}
+
+
+require(["dojo/dom","dijit/registry"], function(dom,registry) {
+window.__openEditServiceDialog = function( service_type, service, properties, owning_identity, owner, users, roles )
+{
+    /* Record that we're showing the editServiceDialog so that functions like
+     * recalculate_charges() can find the correct inputs.
+     *
+     * NOTE - everything up to this point does not care if more than one
+     * service dialog can be open at a time. Here we specifically limit to
+     * a single service.
+     */
+    current_dialog = "edit";
+    current_dialog_init = true;
+    current_service_type = service_type;
+    current_service = service;
+    current_service_properties = properties;
+    current_service_roles = roles;
+
+    /* Init user store to empty list for new service.
+     */
+    current_service_user_store.setData(users);
+
+    /* Hide standby if active.
+     */
+    service_dialog_standby.hide();
+
+    /* Set service type specific text in add dialog.
+     */
+    service_dialog.set('title','Edit '+service_type.name+' '+service.name);
+    registry.byId('service_dialog_submitButton').set('label','Update '+service_type.name);
+
+    /* Set appropriate options for status based on current status.
+     */
+    var status_options = [{
+        label: "Live", value: "live"
+    },{
+        label: "Deleted", value: "Deleted"
+    }];
+    switch( current_service.status ) {
+        case 'requested':
+            status_options.unshift( { label: "Requested", value: "requested" }, { label: "Pending", value: "pending" } );
+            break;
+        case 'pending':
+            status_options.unshift( { label: "Pending", value: "pending" } );
+            break;
+        default:
+            status_options.splice( -1, 0, { label: "Suspended", value: "suspended" } );
+    }
+    registry.byId("service_dialog_statusInput").set( 'options', status_options );
+
+    /* Do all the standard service dialog init stuff
+     */
+    service_dialog_init();
+
+    /* Now show the dialog
+     */
+    service_dialog.show();
+    resize_dialog( service_dialog );
+    current_service_user_grid.startup();
+}});
+
+require(["dojo/dom","dojo/when","dijit/registry"],function(dom,when,registry) {
+window.service_dialog_init = function()
+{
+
+    /* Show/hide message
+     */
+    var message_div = dom.byId('service_dialog_message');
+    if( next_service_dialog_message ) {
+        message_div.innerHTML = next_service_dialog_message;
+        message_div.style.display = 'block';
+        next_service_dialog_message = null;
+    } else {
+        message_div.innerHTML = '';
+        message_div.style.display = 'none';
+    }
+
+    /* Set values for add service form.
+     */
+    registry.byId("service_dialog_orgInput"        ).set( 'value', current_service.owner_id    );
+    registry.byId("service_dialog_descriptionInput").set( 'value', current_service.description );
+
+    registry.byId("service_dialog_statusInput"     ).set( 'value', current_service.status      );
+
+    /* Only show setup charge for status requested or pending 
+     */
+    switch( current_service.status ) {
+        case "requested":
+        case "pending":
+            dom.byId('service_dialog_setup_charge_formitem').style.display = 'block';
+            break;
+        default:
+            dom.byId('service_dialog_setup_charge_formitem').style.display = 'none';
+    }
+
+    /* Set CFOPAL value in service for from cfopal_id
+     */
+    if( current_service.cfopal_id ) {
+        when( cfopal_store.get( current_service.cfopal_id ), function( cfopal ) {
+            registry.byId( "service_dialog_CFOPALInput" ).set( 'value', cfopal.cfopal );
+        } );
+    } else {
+        registry.byId( "service_dialog_CFOPALInput" ).set( 'value', '' );
+    }
+
+    /* Set name input and configure validation, but whether the name can be
+     * changed depends on whether the service is new or depends on its status.
+     */
+    // FIXME - Show or hide name input depending on whether rename should be allowed.
+    var name_input = registry.byId( "service_dialog_nameInput" );
+    if( name_input ) {
+        name_input.set( 'value', current_service.name );
+        configureValidationTextBox( name_input, current_service_type.service_name_validation, current_service_type.service_name_regex );
+    }
+
+    // Set name input label.
+    dom.byId('service_dialog_nameInput_label').innerHTML = current_service_type.service_name_label;
+
+    registry.byId("service_dialog_rtidInput").set( 'value', current_service.rtid );
+    if( current_service.rtid ) {
+        dom.byId('service_dialog_rt_message').innerHTML = '<a href="https://helpdesk.uic.edu/accc/Ticket/Display.html?id='+current_service.rtid+'" target="_blank">#'+current_service.rtid+'</a>';
+    } else {
+        dom.byId('service_dialog_rt_message').innerHTML = "Auto-create ticket in " + current_service_type.rt_queue + " if left blank.";
+    }
+
+    // Set charge overrides
+    service_dialog_enable_charge_override( 'monthly', null != current_service.monthly_charge_override, current_service.monthly_charge_override );
+    service_dialog_enable_charge_override( 'setup',   null != current_service.setup_charge_override,   current_service.setup_charge_override );
+
+    // Clear out properties section
+    properties_pane = registry.byId( "service_dialog_propertiesPane" );
+    properties_pane.destroyDescendants();
+
+    // Add service type specific inputs
+    for( var i in current_service_type.properties ) {
+        var property = current_service_type.properties[i];
+
+        var init_value;
+        switch( property.datatype ) {
+            case "boolean":
+                if( null == current_service_properties[ property.name ] ) 
+                    current_service_properties[property.name] = false;
+                init_value = current_service_properties[property.name];
+                break;
+            case "select":
+                if( current_dialog == "add" && null == current_service_properties[ property.name+"_id" ] ) 
+                    current_service_properties[property.name+"_id"] = property['default_option_id'];
+                init_value = current_service_properties[property.name+"_id"];
+                break;
+            case "string":
+                if( null == current_service_properties[ property.name ] ) {
+                    if( property['default'] && property['default'].match(/%\{[a-z0-9_]+}/) ) {
+                        // Dynamic string default
+                        current_service_properties[property.name] = '';
+                    } else {
+                        current_service_properties[property.name] = property['defalt'];
+                    }
+                }
+                init_value = current_service_properties[property.name];
+            default:
+                if( null == current_service_properties[ property.name ] ) 
+                    current_service_properties[property.name] = property['default'];
+                init_value = current_service_properties[property.name];
+                
+        }
+
+        add_property_formitem(
+            property,
+            init_value,
+            properties_pane.domNode
+        );
+    }
+
+    /* Dialog is basically ready.
+     */
+    current_dialog_init = false;
+
+    /*
+     * Handle any dynamic form updates.
+     */
+    service_dialog_handle_change();
+
+    service_dialog_init_user_grid();
+}});
+
+
+/*
+ * Set up the user grid
+ *
+ * JTK Note: I explored using dgrid and dstore but found they did not work
+ * as predictably as the old dojox/grid/DataGrid. Sticking with the old
+ * grid for now as it is more reliable.
+ */
+require([
+    "dojo/dom-construct",
+    "dojox/grid/DataGrid",
+    "dojo/data/ObjectStore",
+    "dijit/form/CheckBox"
+], function(
+    domConstruct,
+    DataGrid,
+    ObjectStore,
+    CheckBox
+) {
+window.service_dialog_init_user_grid = function()
+{
+    if( current_service_user_grid ) {
+        current_service_user_grid.destroyRecursive();
+    }
+
+    // FIXME - What about services without users?
+    var structure = [{
+        name: "NetID",
+        fields: ["netid->netid","admin_inherited","user_inherited"],
+        formatter: function ( fields ) {
+            if( fields[1] || fields[2] ) {
+                return fields[0] + " (inherited)";
+            } else {
+                return fields[0];
+            }
+        },
+        width: "auto"
+    }];
+
+    for( var i in current_service_roles ) {
+        role = current_service_roles[i];
+        structure.push({
+            name: role.label,
+            field: 'role_'+role.id,
+            cellType: dojox.grid.cells.Bool,
+            editable: true,
+            width: "60px"
+        });
+    }
+
+    structure.push({
+        name: "Admin",
+        fields: ["admin","admin_inherited","id"],
+        formatter: function ( fields ) {
+            var id = fields[2];
+            return new CheckBox({
+                checked: fields[0] || fields[1],
+                disabled: fields[1],
+                onChange: function () {
+                    current_service_user_store.get( id ).admin = this.checked;
+                }
+            });
+        },
+        width: "50px"
+    });
+
+    current_service_user_grid = new DataGrid({
+        sortInfo: 1,
+        store: new ObjectStore({ objectStore: current_service_user_store }),
+        structure: structure,
+        query: { deleted: false }
+    }, domConstruct.create('div',{style: "height: 100%; width: 100%"}));
+    domConstruct.place( current_service_user_grid.domNode, 'service_dialog_user_grid' );
+}});
+
+
+/*
+ * Update service charges display for current dialog
+ */
+require(["dojo/dom"],function(dom) {
+window.service_dialog_update_charges = function() {
+    recalculate_charges( current_service_type, current_service, current_service_properties );
+    dom.byId( 'service_dialog_monthly_charge_display' ).innerHTML = "$" + current_service.monthly_charge.toFixed(2);
+    dom.byId( 'service_dialog_setup_charge_display'   ).innerHTML = "$" + current_service.setup_charge.toFixed(2);
+}});
+
+
+/*
+ * Handle changes in the dialog
+ */
+require(["dijit/registry"],function(registry) {
+window.service_dialog_handle_change = function() {
+
+    // Don't process changes during init.
+    if( current_dialog_init )
+        return;
+
+    /* Collect simple properties.
+     */
+    current_service.status      = registry.byId( "service_dialog_statusInput" ).get( 'value' );
+    current_service.description = registry.byId( "service_dialog_descriptionInput" ).get( 'value' );
+    current_service.name        = registry.byId( "service_dialog_nameInput" ).get( 'value' );
+
+    /* Get charge overrides if enabled
+     */
+    if( service_dialog_monthly_charge_override_toggle.checked ) {
+        current_service.monthly_charge_override = registry.byId('service_dialog_monthly_charge_overrideInput').get( 'value' );
+        current_service.monthly_charge = current_service.monthly_charge_override;
+    } else {
+        current_service.monthly_charge_override = null;
+    }
+    if( service_dialog_setup_charge_override_toggle.checked ) {
+        current_service.setup_charge_override = registry.byId('service_dialog_setup_charge_overrideInput').get( 'value' );
+        current_service.setup_charge = current_service.setup_charge_override;
+    } else {
+        current_service.setup_charge_override = null;
+    }
+
+    // Loop through all the inputs and record values for the service.
+    var property_by_name = {}; // Used to fill in dynamic default strings
+    for( var i in current_service_type.properties ) {
+        var property = current_service_type.properties[i];
+	property_by_name[ property.name ] = property;
+        var widget = registry.byId( "service_dialog_" + property.name + "Input" );
+        // if(property.name == "cpu_hours")
+         // {
+         //      widget.set("disabled",true);
+         // }
+         // else
+        // {
+         //        widget.set("enabled",true);
+         // }
+
+        switch( property.datatype ) {
+            case "boolean":
+                current_service_properties[ property.name ] = widget.get('checked');
+                break;
+            case "select":
+                var option_id = widget.get('value');
+                if( option_id == 0 ) {
+                    current_service_properties[ property.name + "_id"] = null;
+                } else {
+                    current_service_properties[ property.name + "_id"] = widget.get('value');
+                }
+                break;
+            case "string":
+                // Don't check required on strings yet so as not to interfere
+                // with handling of dynamic defaults.
+                current_service_properties[ property.name ] = widget.get('value');
+                break;
+            default:
+                current_service_properties[ property.name ] = widget.get('value');
+        }
+    }
+
+    // Look for dynamic defaults on any string properties and fill those in if needed.
+    for( var i in current_service_type.properties ) {
+        var property = current_service_type.properties[i];
+	// Skip anything except strings.
+        if( property.datatype != "string" )
+            continue;
+	// Skip any strings with values.
+        if( 0 !== current_service_properties[ property.name ].length )
+            continue;
+	// Skip string properties without dynamic defaults
+        if( !property['default'] || !property['default'].match(/%\{[a-z0-9_]+}/) )
+            continue;
+
+        // Try to fill in dynamic default.
+        var ddvalue = property['default'];
+
+	var match;
+	var incomplete;
+	var success;
+        while( match = ddvalue.match(/%\{([a-z0-9_]+)}/) ) {
+	    var varname = match[1];
+
+            // Pessimestic coding... assume this isn't going to work...
+	    success = false;
+
+	    // varname == 'name' is handled specially because it isn't a service property.
+	    if( varname == 'name' ) {
+	        if( 0 === current_service.name.length )
+		    break;
+                ddvalue = ddvalue.replace( '%{name}', current_service.name );
+                continue;
+            }
+
+            var propref= property_by_name[ varname ];
+	    if( !propref ) {
+		console.log("Impossible to complete dynamic default "+property['default']+". No such property '"+varname+"'.");
+            }
+
+            switch( propref.datatype ) {
+                case "string":
+		    if( 0 !== current_service_properties[ propref.name ].length ) {
+                        ddvalue = ddvalue.replace( '%{'+propref.name+'}', current_service_properties[ propref.name ] );
+			success = true;
+                    }
+                    break;
+		case "select":
+		    if( current_service_properties[ propref.name + "_id" ] ) {
+			for( var j in propref.options ) {
+			    var opt = propref.options[j];
+			    if( opt.id == current_service_properties[ propref.name + "_id" ] ) {
+                        	ddvalue = ddvalue.replace( '%{'+propref.name+'}', opt.value );
+				success = true;
+				break;
+			    }
+			}
+		    }
+		    break;
+                default: 
+		    console.log("Impossible to complete dynamic default "+property['default']+". No support for dynamic defaults using "+propref.datatype);
+	    }
+	    if( !success )
+	        break;
+	}
+	if( success ) {
+            current_service_properties[ property.name ] = ddvalue;
+	    registry.byId( "service_dialog_" + property.name + "Input" ).set( 'value', ddvalue );
+        }
+    }
+    
+    /* Recalculate changes and update dialog.
+     */
+    service_dialog_update_charges();
+
+    // FIXME - Handle individually owned services
+    var new_owner_id = registry.byId( "service_dialog_orgInput" ).get( 'value' );
+    if( new_owner_id && new_owner_id != current_service.owner_id ) {
+        current_service.owner_id = new_owner_id;
+
+        // Handle org owner inherited users and admins.
+
+        // Mark all the inherited users as deleted.
+        var inherited_users = current_service_user_store.query({ user_inherited: true });
+        for( var i in inherited_users ) {
+            inherited_users[i].deleted = true;
+            inherited_users[i].user_inherited = false;
+        }
+        inherited_users = current_service_user_store.query({ admin_inherited: true });
+        for( var i in inherited_users ) {
+            inherited_users[i].deleted = true;
+            inherited_users[i].admin_inherited = false;
+        }
+
+        liaison_store.query({
+            org_id: current_service.owner_id,
+            liaison_type_id: [
+                current_service.admin_liaison_type_id,
+                current_service.user_liaison_type_id
+            ],
+            '-cols': 'liaison_type_id,person->identity->primary_netid_id'
+        }).then( function( liaisons ) {
+            for ( var i in liaisons ) {
+                liaison = liaisons[i]; 
+                __service_dialog_add_user(
+                    liaison['person->identity->primary_netid_id'],
+                    current_service.user_liaison_type_id  == liaison.liaison_type_id,
+                    current_service.admin_liaison_type_id == liaison.liaison_type_id
+                );
+            }
+        });
+    }
+
+    /*
+     * Get option property rtid
+     */
+    current_service.rtid = registry.byId( "service_dialog_rtidInput" ).get( 'value' );
+
+    /*
+     * Resolve cfopal value to an id and update the cfopal_id
+     */
+    var cfopal_input = registry.byId( "service_dialog_CFOPALInput" );
+
+    /* Set required on cfopal input based on whether the service has an associated charge. */
+    if( current_service.monthly_charge == 0 && current_service.setup_charge == 0 ) {
+        cfopal_input.set( 'required', false );
+    } else {
+        cfopal_input.set( 'required', true );
+    }
+
+    var cfopal_value = cfopal_input.get( 'value' );
+    if( cfopal_value == '' ) {
+        current_service.cfopal_id = null;
+    } else {
+        var result = cfopal_store.query({cfopal:cfopal_value},{queryCache:true});
+        if( result.length == 1 ) {
+            var cfopal = result[0];
+            current_service.cfopal_id = cfopal.id;
+        } else {
+            current_service.cfopal_id = null;
+        }
+    }
+}});
+
+
+/*
+ * Functions to enable or disable submit button on service dialog.
+ */
+require(["dijit/registry"],function(registry) {
+window.service_dialog_disable_submit = function ()
+{
+    registry.byId('service_dialog_submitButton').set('disabled',true);
+};
+window.service_dialog_enable_submit = function ()
+{
+    registry.byId('service_dialog_submitButton').set('disabled',false);
+};
+});
+
+
+/*
+ * configureValidationTextBox( textbox, validation_style, validation_regexp )
+ */
+require(["dojo/when","dijit/form/ValidationTextBox"], function(when, ValidationTextBox) {
+window.configureValidationTextBox = function( textbox, validation_style, validation_regexp )
+{
+    // Save default validator method in case of override.
+    if( ! textbox.default_validator ) {
+        textbox.default_validator = textbox.validator;
+    }
+
+    // Revert to default validator before configuring.
+    textbox.validator = textbox.default_validator;
+
+    if( validation_style ) {
+        switch( validation_style ) {
+            case "dns-domain":
+                /* Just check for a valid DNS domain string.
+                 * This check isn't perfect, but it is hopefully good
+                 * enough.
+                 */
+                textbox.set('regExp','^[a-z0-9][a-z0-9\\-]*(\\.[a-z0-9][a-z0-9\-]*)*(\\.[a-z]+)$');
+                break;
+            default:
+                console.log("Unable to handle validation style "+validation_style);
+        }
+    } else if( validation_regexp ) {
+        textbox.set('regExp', validation_regexp );
+    } else {
+        textbox.set('regExp', null );
+    }
+}});
+
+function current_service_requires_cfopal ()
+{
+    if( !current_service )
+        return;
+     return(current_service.monthly_charge > 0 || current_service.setup_charge > 0 || current_service.service_type_id == 68); //exception made for Acer service because while there
+// are charges made, they are not monthly. MUST MODIFY NUMBER ACCORDINGLY IN PRODUCTiON
+}
+
+require(["dojo/Deferred"], function(Deferred) {
+window.validateCFOPAL = function(value, constraints)
+{
+    var cfopal_input = this;
+
+    if( "" == value ) {
+        if( !current_service_requires_cfopal() )
+            return true;
+        cfopal_input.set('invalidMessage','Please provide a CFOPAL.');
+        return false;
+    }
+
+    /* Validate basic CFOPAL format */
+    var cfopal_regexp = /^(\d)-?(\d{4}[\dY]{2})-?(\d{6})-?-?(\d{6})$/;
+    var match = cfopal_regexp.exec( value );
+    if( !match ) {
+        cfopal_input.set('invalidMessage','Invalid CFOPAL format.');
+        return false;
+    }
+
+    formatted_value = match[1]+'-'+match[2]+'-'+match[3]+'--'+match[4];
+
+    /* Set the input to the official CFOPAL format, which will again
+     * kick off validation.
+     */
+    if( value != formatted_value ) {
+        cfopal_input.set('value',formatted_value);
+        return;
+    }
+
+    /* Check the cfopal_store cache to see if the fopal appears.
+     */
+    var cfopals = cfopal_store.query({cfopal:value},{queryCache:true});
+    if( cfopals.length == 1 ) {
+        if( cfopals[0].status == "invalid" ) {
+            cfopal_input.set('invalidMessage','CFOPAL could not be validated.');
+            return false;
+        } else {
+            return true;
+        }
+    }
+    
+    /* Now we would like to run this check against the REST api, but
+     * it appears that ValidationTextBox doesn't understand deferred
+     * responses. So we need to kick off the validation and return
+     * true, then trick it into revalidating once the result is in
+     * the cache.
+     */
+    cfopal_store.query({cfopal:value},{}).then( function(cfopals) {
+        if( cfopals.length == 0 ) {
+            cfopal_store._cache.put({
+                cfopal: value,
+                status: "invalid"
+            });
+            cfopal_input.set('value',value);
+        }
+    });
+
+    return true;
+}});
+
+
+require(["dojo/query","dojo/window"], function(query,win) {
+window.resize_dialog = function(dialog)
+{
+    var nodes = query( ".dijitDialogPaneContent", dialog.domNode );
+    var contentdiv = nodes[0];
+
+    // Avoid resizing quirks by setting min-width
+    contentdiv.style.minWidth = (service_dialog_width - 4) +"px";
+
+    // 30 px for the title bar
+    var height = contentdiv.scrollHeight + 30;
+    var viewport_size = win.getBox();
+    if( height > viewport_size.h - 20 )
+        height = viewport_size.h - 20;
+
+    // Reposition dialog to center vertically
+    service_dialog.domNode.style.top = ( (viewport_size.h - height) / 2 ) + "px";
+    service_dialog.domNode.style.width  = service_dialog_width+"px";
+    service_dialog.domNode.style.height = height+"px";
+    service_dialog.domNode.style.overflowX = 'hidden';
+    service_dialog.domNode.style.overflowY = 'auto';
+}});
+
+require(["dojo/dom-construct","dojo/on"], function(domConstruct,on) {
+window.add_property_formitem = function( property, value, dom_node )
+{
+    var formitem = domConstruct.create("div", {
+        class: 'formitem'
+    }, dom_node );
+
+    domConstruct.create("label", {
+        for: 'service_dialog_' + property.name,
+        innerHTML: property.label
+    }, formitem );
+
+    var widget;
+    switch( property.datatype ) {
+        case "boolean":
+            widget = make_boolean_property_dijit(
+                property,
+                value
+            );
+            break;
+        case "quantity":
+            widget = make_quantity_property_dijit(
+                property,
+                value
+            );
+            break;
+        case "select":
+            widget = make_select_property_dijit(
+                property,
+                value
+            );
+            break;
+        case "string":
+            widget = make_string_property_dijit(
+                property,
+                value
+            );
+            break;
+        default:
+	    throw new Error("Unable to handle datatype: "+property.datatype);
+    }
+
+    on( widget, 'change', service_dialog_handle_change );
+    widget.placeAt(formitem);
+
+    if( "quantity" == property.datatype ) {
+        var unit = property.unit || '';
+        var explanation = ' ' + unit;
+        if( property.monthly_charge && property.monthly_charge > 0 ) {
+            if( property.minimum > 0 ) {
+                explanation += ' (base ' + property.minimum + ' ' + unit + ', extra ';
+            } else {
+                explanation += ' (';
+            }
+            explanation += '$' + (property.monthly_charge * property.increment).toFixed(2) + '/month per ' + property.increment + ' ' + unit + ')';
+        }
+        domConstruct.place(document.createTextNode(explanation),formitem);
+    }
+
+}});
+
+require(["dijit/form/CheckBox"], function(CheckBox) {
+window.make_boolean_property_dijit = function( property, value )
+{
+    return new CheckBox({
+        'id': 'service_dialog_' + property.name + "Input",
+        'name': 'service_dialog_' + property.name,
+        'value': true,
+	'checked': value
+    });
+}});
+
+require(["dijit/form/NumberSpinner"], function(NumberSpinner) {
+window.make_quantity_property_dijit = function( property, value )
+{
+    return new NumberSpinner({
+        'id': 'service_dialog_' + property.name + "Input",
+        'name': 'service_dialog_' + property.name,
+        'value': value,
+        'constraints': {
+            'min': property.minimum,
+            'max': property.maximum,
+	    'pattern' : 0.00,
+            'places': 0
+        },
+        'intermediateChanges': true,
+        'smallDelta': property.increment,
+        'style': "width: 80px"
+    });
+}});
+
+require(["dijit/form/Select"], function(Select) {
+window.make_select_property_dijit = function( property, option_id )
+{
+    var options = new Array();
+    for( var i in property.options ) {
+        var option = property.options[i];
+        var label = option.label;
+        if( option.setup_charge && 0 < option.setup_charge ) {
+            label += " - $"+option.setup_charge.toFixed(2);
+        }
+        if( option.monthly_charge && 0 < option.monthly_charge ) {
+            label += " - $"+option.monthly_charge.toFixed(2)+"/month";
+        }
+        options.push({"label":label,"value":option.id});
+    }
+
+    // FIXME - There must be a better way to allow the widget to start with no value?
+    if( !option_id ) {
+        option_id = null;
+        options.unshift({"label":"","value":0});
+    }
+
+    return new Select({
+        'emptyLabel': '<span style="color: #aaa">- select '+property.name+' -</span>',
+        'id': 'service_dialog_' + property.name + "Input",
+        'name': 'service_dialog_' + property.name,
+        'value': option_id,
+        'options': options,
+        'required': property.required
+    });
+}});
+
+require(["dijit/form/ValidationTextBox"], function(ValidationTextBox) {
+window.make_string_property_dijit = function( property, value )
+{
+    var textbox = new ValidationTextBox({
+        'id': 'service_dialog_' + property.name+"Input",
+        'name': 'service_dialog_' + property.name,
+        'value': value,
+        'required': property.required
+    });
+    configureValidationTextBox( textbox, property.validation, property.validation_regexp )
+    return textbox;
+}});
+
+function recalculate_charges( service_type, service, service_properties ) {
+    var monthly_charge = service_type.monthly_charge;
+    var setup_charge   = service_type.setup_charge;
+    for( var i=0; i < service_type.properties.length; ++i ) {
+        var property = service_type.properties[i];
+
+	switch( property.datatype ) {
+            case "boolean":
+		// FIXME - No way to charge for booleans yet.
+                break;
+            case "quantity":
+                var n = service_properties[ property.name ];
+                // n -= property.minimum;
+		if( property.monthly_charge )
+                    monthly_charge += n * property.monthly_charge;
+		if( property.setup_charge )
+                    setup_charge += n * property.setup_charge;
+                break;
+            case "select":
+		var val = service_properties[ property.name + '_id'];
+		for( var j=0; j < property.options.length; ++j ) {
+                    var option = property.options[j];
+                    if( option.id == val ) {
+                        if( option.monthly_charge )
+                            monthly_charge += option.monthly_charge;
+                        if( option.setup_charge )
+                            setup_charge += option.setup_charge;
+                        break;
+                    }
+                }
+                break;
+            default:
+		// No way to charge for other data types.
+                
+        }
+    }
+    if( null == service.monthly_charge_override )
+        service.monthly_charge = monthly_charge;
+    if( null == service.setup_charge_override )
+        service.setup_charge = setup_charge;
+}
+
+function service_dialog_refresh_user_grid ()
+{
+    current_service_user_grid.setQuery({ deleted: false });
+}
+
+function service_dialog_add_user()
+{
+    var netid_id = service_dialog_new_userInput.get('value');
+    if( ! netid_id ) return;
+    __service_dialog_add_user(netid_id);
+    service_dialog_new_userInput.set('value',null);
+}
+
+require(["dojo/when"], function(when) {
+window.__service_dialog_add_user = function(netid_id,user_inherited,admin_inherited)
+{
+    var id = [current_service.id, current_service_type.id, netid_id].join(',');
+
+    // Check if user already associated with service
+    var service_user = current_service_user_store.get( id );
+    if( service_user ) {
+        if( service_user.deleted ) {
+            service_user.deleted = false;
+            if( service_user.user_inherited ) {
+                service_user.user_inherited = true;
+            }
+            if( service_user.admin_inherited ) {
+                service_user.admin = true;
+                service_user.admin_inherited = true;
+            }
+            service_dialog_refresh_user_grid();
+        } else {
+            return;
+        }
+    }
+
+    when( netid_store.get( netid_id ), function( netid ) {
+        current_service_user_store.put({
+            id: id,
+            deleted: false,
+            new: true,
+            service_id: current_service.id,
+            service_type_id: current_service_type.id,
+            netid_id: netid_id,
+            'netid->netid': netid.netid,
+            admin: admin_inherited || false,
+            user_inherited: user_inherited || false,
+            admin_inherited: admin_inherited || false
+        });
+        service_dialog_refresh_user_grid();
+    });
+}});
+
+function service_dialog_remove_users() {
+    var selected = current_service_user_grid.selection.getSelected();
+    for( var i in selected ) {
+        var user = selected[i];
+
+        // Can't delete inherited users
+        if( user.admin_inherited || user.user_inherited )
+            continue;
+
+        if( user.new ) {
+            current_service_user_store.remove( user.id );
+        } else {
+            user.deleted = true;
+        }
+    }
+    service_dialog_refresh_user_grid();
+}
+
+require(["dojo/dom","dijit/registry"],function(dom,registry) {
+window.service_dialog_enable_charge_override = function(which,enable,value)
+{
+    var charge_display = dom.byId( 'service_dialog_'+which+'_charge_display' );
+    var override_widget = registry.byId( 'service_dialog_'+which+'_charge_overrideInput' );
+    if( null == value ) {
+        value = current_service[ which + '_charge' ];
+    }
+    if( enable ) {
+        charge_display.style.display = 'none';
+        override_widget.set( 'value', value );
+        override_widget.domNode.style.display = 'inline-block';
+    } else {
+        charge_display.style.display = 'inline';
+        override_widget.domNode.style.display = 'none';
+    }
+}});
+
+function service_dialog_submit()
+{
+    if( !service_dialog_form.validate() ) {
+        show_alert("Please check the form for errors.");
+        return;
+    }
+
+    if( current_service.description == "" ) {
+        show_alert("Please provide a description.");
+        return;
+    }
+
+    service_dialog_standby.show();
+
+    if( current_dialog == "add" ) {
+        submit_add_service();
+    } else {
+        submit_edit_service();
+    }
+}
+
+function submit_add_service()
+{
+    current_service[ 'service_' + current_service_type.table_name ] = current_service_properties;
+
+    service_store.put( current_service ).then(
+	function( new_service ) {
+            current_service.id = new_service.id;
+            service_role_store.query({ service_id: new_service.id }).then( function( roles ) {
+                current_service_roles = roles;
+                var users = current_service_user_store.query({});
+                for( var i=0; i < users.length; ++i ) {
+                    var user = users[i];
+                    for( var j=0; j < roles.length; ++j ) {
+                        var role = roles[j];
+                        if( user['role_'+role.service_type_role_id] ) {
+                            delete user['role_'+role.service_type_role_id];
+                            user['role_'+role.id] = true;
+                        }
+                    }
+                }
+                submit_commit_users();
+            } );
+        },
+        function( err ) {
+            console.log( err );
+            show_alert( err.responseText );
+            service_dialog_standby.hide();
+        }
+    );
+}
+
+function submit_edit_service()
+{
+    current_service[ 'service_' + current_service_type.table_name ] = current_service_properties;
+    service_store.put( current_service, { id: current_service.id } ).then(
+	function( service ) {
+            submit_commit_users();
+        },
+        function( err ) {
+            console.log( err );
+            var rtext = service_put.ioArgs.xhr.responseText;
+            if( rtext ) {
+                // FIXME - Better way to show errors?
+                show_alert(rtext);
+                service_dialog_standby.hide();
+            }
+        }
+    );
+}
+
+require(["dojo/promise/all","dojo/_base/array","dojo/Deferred"], function(all,array,Deferred) {
+window.submit_commit_users = function()
+{
+    var promises = {};
+    var users = current_service_user_store.query({});
+    array.forEach( users, function( user ) {
+        var user_id = [
+            current_service.id,
+            current_service.service_type_id,
+            user.netid_id
+        ].join(',');
+
+        if( user.deleted ) {
+            promises['remove_'+user_id] = service_user_store.remove( user_id );
+        } else {
+            // Put the user then handle roles.
+            var deferred = new Deferred();
+            promises['save_'+user_id] = deferred;
+            service_user_store.put({
+                id:              user_id,
+                service_id:      current_service.id,
+                service_type_id: current_service.service_type_id,
+                netid_id:        user.netid_id,
+                admin:           user.admin
+            },{
+                id: user_id
+            }).then( function( put_user ) {
+                var role_promises = {};
+                array.forEach( current_service_roles, function( role ) {
+                    var user_role_id = [
+		        current_service.id,
+                        current_service.service_type_id,
+                        user.netid_id,
+                        role.id
+	            ].join(',');
+                    if( user[ 'role_'+role.id ] && ! user[ 'role_'+role.id+'_init' ] ) {
+                        role_promises['add_'+role.id] = service_user_role_store.put({
+			    service_id: current_service.id,
+                            service_type_id: current_service.service_type_id,
+                            netid_id: user.netid_id,
+                            service_role_id: role.id
+                        },{
+                            id: user_role_id
+                        });
+                    } else if( user[ 'role_'+role.id+'_init' ] && ! user[ 'role_'+role.id ] ) {
+                        role_promises['remove_'+role.id] = service_user_role_store.remove( user_role_id );
+                    }
+                } );
+                all( role_promises ).then( function( results ) {
+                    deferred.resolve( put_user );
+                });
+            });
+        }
+    });
+
+    all( promises ).then( function(results) {
+        if( current_dialog == 'add' ) {
+            next_service_dialog_message = "Created " + current_service_type.name + ".";
+        } else {
+            next_service_dialog_message = "All Changes Saved.";
+        }
+        service_dialog_standby.hide();
+        openEditServiceDialog( current_service.id );
+    });
+}});
+
+require(["dojo/dom"], function(dom) {
+window.show_alert = function( message )
+{
+    dom.byId("alert_dialog_message").innerHTML = message;
+    alert_dialog.show();
+}});
+
+</script>
+
+<div id="gridContainerDiv" style="width: 100%; height: 450px; background-color: #bbb; display: none">
+  <div id="service_grid_toolbar" data-dojo-type="dijit/Toolbar">
+
+    <span id="serviceNameFilter" data-dojo-type="dijit/form/TextBox" data-dojo-props="placeHolder: 'Filter Name', disabled: true">
+      <script type="dojo/on" data-dojo-event="change">
+		service_grid_refresh();
+      </script>
+      <script type="dojo/on" data-dojo-event="keydown" data-dojo-args="e">
+	// Process change if Enter is pressed
+	if( e.keyCode == 13 ) {
+	    service_grid_refresh();
+	}
+      </script>
+    </span>
+
+    <span id="orgFilter" data-dojo-type="dijit/form/ComboBox" data-dojo-props="store:org_dataStore, searchAttr:'description', queryExpr:'*${0}*', labelAttr: 'description', fetchProperties: { sort: [{ attribute: 'description' }] }, pageSize:12, autoComplete: false, placeHolder: 'Filter Org', required: false, disabled: true">
+      <script type="dojo/on" data-dojo-event="change">
+		service_grid_refresh();
+      </script>
+      <script type="dojo/on" data-dojo-event="keydown" data-dojo-args="e">
+	// Process change if Enter is pressed
+	if( e.keyCode == 13 ) {
+	    service_grid_refresh();
+	}
+      </script>
+    </span>
+
+    <!-- Dropdown filter for service types. -->
+    <span id="serviceTypeFilter" data-dojo-type="dijit/form/Select" data-dojo-props="disabled: true">
+      <span value=""><span style="color: #aaaaaa; font-style: italic">Filter Service Type</span></span>
+[% FOREACH service_type_name IN service_types.keys.sort %]
+[% service_type = service_types.$service_type_name %]
+      <span value="[% service_type.id %]"><span>[% service_type.name %]</span></span>
+[% END %]
+      <script type="dojo/on" data-dojo-event="change">
+        service_grid_refresh();
+      </script>
+    </span>
+
+
+    <span id="cfopalFilter" data-dojo-type="dijit/form/ComboBox" data-dojo-props="store:cfopal_dataStore, searchAttr:'cfopal', labelAttr: '%{cfopal} - %{description}',  fetchProperties: { sort: [{ attribute: 'cfopal' }], queryCache: true }, query: { status: 'active' }, autoComplete: false, placeHolder: 'Filter CFOPAL', required: false, disabled: true">
+      <script type="dojo/on" data-dojo-event="change">
+	service_grid_refresh();
+      </script>
+    </span>
+
+    <!-- Dropdown filter for monthly charge. -->
+    <span id="monthly_chargeFilter" data-dojo-type="dijit/form/Select" data-dojo-props="disabled: true">
+      <span value="">Filter Charge</span>
+      <span value="free">Free</span>
+      <span value="billing">Billing</span>
+      <script type="dojo/on" data-dojo-event="change">
+        service_grid_refresh();
+      </script>
+    </span>
+
+    <!-- Dropdown filter for service types. -->
+    <span id="statusFilter" data-dojo-type="dijit/form/Select" data-dojo-props="disabled: true">
+      <span value="requested,pending,live,suspended">Any Status</span>
+      <span value="requested,pending,live,suspended,deleted">Any Status or Deleted</span>
+      <span value="requested">Status Requested</span>
+      <span value="pending">Status Pending</span>
+      <span value="live">Status Live</span>
+      <span value="suspended">Status Suspended</span>
+      <span value="deleted">Deleted Only</span>
+      <script type="dojo/on" data-dojo-event="change">
+        service_grid_refresh();
+      </script>
+    </span>
+
+    <button type="button" data-dojo-type="dijit/form/Button" data-dojo-props="iconClass: 'dijitIconNewTask', disabled: true">Create Service
+      <script type="dojo/on" data-dojo-event="click">
+        addServiceTypeSelectInput.set('value',0);
+        addServiceTypeSelectDialog.show();
+      </script>
+    </button>
+    <button type="button" data-dojo-type="dijit/form/Button" data-dojo-props="iconClass: 'dijitIconNewTask', disabled: true">Create Service Type
+      <script type="dojo/on" data-dojo-event="click">
+	service_type_dialog.show();
+      </script>
+    </button>
+
+    <button type="button" data-dojo-type="dijit/form/Button" data-dojo-props="iconClass: 'dijitIconSave', disabled: true">Download
+      <script type="dojo/on" data-dojo-event="click">
+	service_grid_download();
+      </script>
+    </button>
+
+  </div>
+</div>
+
+<!-- addServiceTypeSelectDialog -->
+<div data-dojo-type="dijit/Dialog"
+     data-dojo-id="addServiceTypeSelectDialog"
+     title="Select New Service Type"
+     style="width: 200px; height: 80px; text-align: center; overflow: auto; background-color: white; display: none">
+
+  <span data-dojo-id="addServiceTypeSelectInput" data-dojo-type="dijit/form/Select">
+    <span value="0"><span style="color: #aaaaaa; font-style: italic">Select Service Type</span></span>
+[% FOREACH service_type_name IN service_types.keys.sort %]
+[% service_type = service_types.$service_type_name %]
+    <span value="[% service_type.id %]"><span>[% service_type.name %]</span></span>
+[% END %]
+    <script type="dojo/on" data-dojo-event="change">
+      var service_type_id = addServiceTypeSelectInput.get('value');
+      if( service_type_id > 0 ) {
+          addServiceTypeSelectDialog.hide();
+          openAddServiceDialog( service_type_id );
+      }
+    </script>
+  </span>
+
+</div>
+<!-- end addServiceTypeSelectDialog -->
+
+<!-- generic styled alert dialog -->
+<div data-dojo-type="dijit/Dialog"
+     data-dojo-id="alert_dialog"
+     title="Alert">
+  <div id="alert_dialog_message"></div>
+</div>
+
+<div data-dojo-type="dijit/Dialog"
+	data-dojo-id="service_type_dialog"
+	id="service_type_dialog"
+	title="Add Service Type"
+	style="display: none">
+ <div data-dojo-id="service_type_dialog_form" data-dojo-type="dijit/form/Form"/>
+   <div class="formitem" id="service_type_dialog_name_formitem">
+      <label for="service_type_dialog_name" id="service_type_dialog_name_label">Name</label>
+      <input name="service_type_dialog_name"
+             id="service_type_dialog_nameInput"
+             onchange="service_dialog_type_handle_change"
+		style: "width:500em;"
+             data-dojo-type="dijit/form/ValidationTextBox" required>
+    </div>
+   <div class="formitem" id="service_type_dialog_tablename_formitem">
+      <label for="service_type_dialog_name" id="service_type_dialog_tablename_label">Table Name</label>
+      <input name="service_type_dialog_tablename"
+             id="service_type_dialog_tablename"
+             onchange="service_dialog_type_handle_change"
+             data-dojo-type="dijit/form/ValidationTextBox" required>
+    </div>
+   <div class="formitem" id="service_type_dialog_rtq_formitem">
+      <label for="service_type_dialog_name" id="service_type_dialog_rtq_label">RT Queue</label>
+      <input name="service_type_dialog_rtq"
+             id="service_type_dialog_rtq"
+             onchange="service_dialog_type_handle_change"
+             data-dojo-type="dijit/form/ValidationTextBox" required>
+    </div>
+   <div class="formitem" id="service_type_dialog_servicenamelabel_formitem">
+      <label for="service_type_dialog_name" id="service_type_dialog_servicenamelabel_label">Service Name Label</label>
+      <input name="service_type_dialog_servicenamelabel"
+             id="service_type_dialog_servicenamelabel"
+             onchange="service_dialog_type_handle_change"
+             data-dojo-type="dijit/form/ValidationTextBox" required>
+    </div>
+   <div class="formitem" id="service_type_dialog_servicenameregex_formitem">
+      <label for="service_type_dialog_name" id="service_type_dialog_servicenameregex_label">Service Name Regex</label>
+      <input name="service_type_dialog_servicenameregex"
+             id="service_type_dialog_servicenameregex"
+             onchange="service_dialog_type_handle_change"
+             data-dojo-type="dijit/form/ValidationTextBox" required>
+    </div>
+
+   <div class="formitem" id="service_type_dialog_tablename_formitem">
+      <label for="service_type_dialog_name" id="service_type_dialog_tablename_label">Owner Type</label>
+<select name="service_type_dialog_ownertype" id="service_type_dialog_ownertype"  data-dojo-type="dijit/form/Select"
+onchange="service_dialog_type_handle_change"
+>
+  <option value="none">None</option>
+    <option value="owner" >Owner</option>
+   <option value="single" >Single</option>
+   <option value="multi" >Multi</option>
+   <option value="external" >External</option>
+ <option value="custom" >Custom</option>
+</select>  
+    </div>
+
+    <div class="formitem" id="service_type_dialog_userhandling_formitem">
+      <label for="service_type_dialog_userhandling">User Handling</label>
+<select name="service_type_dialog_user_handling" id="service_type_dialog_user-handling"  data-dojo-type="dijit/form/Select"
+onchange="service_dialog_type_handle_change"
+>
+    <option value="none">None</option>
+    <option value="owner" >Owner</option>
+   <option value="single" >Single</option>
+   <option value="multi" >Multi</option>
+   <option value="external" >External</option>
+ <option value="custom" >Custom</option>
+</select>
+</div>
+</div>
+<div id="hiddenitems">
+   <div class="formitem" id="service_type_dialog_monthlycharge_formitem">
+      <label for="service_type_dialog_name" id="service_type_dialog_monthlycharge_label">Monthly Charge</label>
+      <input name="service_type_dialog_monthlycharge"
+             id="service_type_dialog_monthlycharge"
+             onchange="service_dialog_type_handle_change"
+             data-dojo-type="dijit/form/ValidationTextBox" required>
+    </div>
+  <div class="formitem" id="service_type_dialog_setupcharge_formitem">
+      <label for="service_type_dialog_name" id="service_type_dialog_setupcharge_label">Setup Charge</label>
+      <input name="service_type_dialog_setupcharge"
+             id="service_type_dialog_setupcharge"
+             onchange="service_dialog_type_handle_change"
+             data-dojo-type="dijit/form/ValidationTextBox" required>
+    </div>
+</div>
+<div class="formitem" id="service_type_dialog_description_formitem">
+      <label for="service_type_dialog_description">Description</label>
+      <textarea name="service_type_dialog_description"
+                id="service_type_dialog_descriptionInput"
+		style: "width:300px;"
+                onchange="service_dialog_type_handle_change"
+                data-dojo-type="dijit/form/Textarea" required></textarea>
+    </div>
+ <div class="button-area">
+      <button id="service_dialog_type_submitButton" data-dojo-type="dijit/form/Button" type="button">Add Service Type
+        <script type="dojo/on" data-dojo-event="click">
+          service_dialog_type_submit();
+        </script>
+      </button>
+    </div>
+
+</div>
+
+<!-- serviceDialog -->
+<div data-dojo-type="dijit/Dialog"
+     data-dojo-id="service_dialog"
+     id="service_dialog"
+     title="FILLED IN BY openAddServiceDialog(...)"
+     style="display: none">
+
+  <div data-dojo-id="service_dialog_form" data-dojo-type="dijit/form/Form"/>
+
+    <div class="message" id="service_dialog_message" style="display: none"></div>
+
+    <div class="formitem" id="service_dialog_name_formitem">
+      <label for="service_dialog_name" id="service_dialog_nameInput_label">Name</label>
+      <input name="service_dialog_name"
+             id="service_dialog_nameInput"
+             onchange="service_dialog_handle_change"
+             data-dojo-type="dijit/form/ValidationTextBox" required>
+    </div>
+  
+    <!-- FIXME - Allow for services owned by person identities. -->
+    <div class="formitem" id="service_dialog_org_formitem">
+      <label for="service_dialog_org">Owner</label>
+      <input name="service_dialog_org"
+             id="service_dialog_orgInput"
+             onchange="service_dialog_handle_change"
+             data-dojo-type="dijit/form/FilteringSelect"
+             data-dojo-props="store:org_store, searchAttr:'description', queryExpr:'*${0}*', searchDelay: 500, labelAttr: 'description', fetchProperties: { sort: [{ attribute: 'description' }] }, query: {}, pageSize: 12, placeHolder:'Select Org', autoComplete: false" required>
+    </div>
+  
+    <div class="formitem" id="service_dialog_CFOPAL_formitem">
+      <label for="service_dialog_CFOPAL">CFOPAL</label>
+      <input name="service_dialog_CFOPAL"
+             id="service_dialog_CFOPALInput"
+             onchange="service_dialog_handle_change"
+             data-dojo-type="dijit/form/ComboBox"
+             data-dojo-props="store:cfopal_dataStore, searchAttr:'cfopal', labelAttr: '%{cfopal} - %{description}', fetchProperties: { sort: [{ attribute: 'cfopal' }], queryCache: true }, query: {status:'active'}, pageSize: 12, validator: validateCFOPAL, placeHolder:'X-XXXXXX-XXXXXX--XXXXXX'">
+    </div>
+  
+    <!-- SERVICE SPECIFIC STUFF GOES HERE -->
+    <div id="service_dialog_propertiesPane"
+         data-dojo-type="dijit/layout/ContentPane">
+    </div>
+  
+    <div class="formitem" id="service_dialog_rtid_formitem">
+      <label for="service_dialog_rtid">RT Ticket #</label>
+      <input name="service_dialog_rtid"
+             id="service_dialog_rtidInput"
+             onchange="service_dialog_handle_change"
+             data-dojo-type="dijit/form/ValidationTextBox"
+             data-dojo-props="regExp:'^[0-9]{0,8}$'">
+      <span id="service_dialog_rt_message"></span>
+    </div>
+           
+    <div class="formitem" id="service_dialog_status_formitem">
+      <label for="service_dialog_status">Status</label>
+      <select name="service_dialog_status"
+              id="service_dialog_statusInput"
+              onchange="service_dialog_handle_change"
+              data-dojo-type="dijit/form/Select">
+        <option value="pending">Pending</option>
+        <option value="live">Live</option>
+      </select>
+    </div>
+
+    <div class="formitem" id="service_dialog_description_formitem">
+      <label for="service_dialog_description">Description</label>
+      <textarea name="service_dialog_description"
+                id="service_dialog_descriptionInput"
+                onchange="service_dialog_handle_change"
+                data-dojo-type="dijit/form/Textarea" required></textarea>
+    </div>
+  
+    <div class="formitem" id="service_dialog_users_formitem">
+      <label>Users</label>
+      <!-- Insert users grid here -->
+      <div id="service_dialog_user_grid"></div>
+      <input id="service_dialog_new_userInput"
+             data-dojo-id="service_dialog_new_userInput"
+             data-dojo-type="dijit/form/FilteringSelect"
+             data-dojo-props="store:netid_store, searchAttr:'netid', labelAttr:'netid', fetchProperties: { sort: [{ attribute:'netid' }] }, query: {}, pageSize: 12, placeHolder:'User NetID', required:false, onKeyPress: function(event) { if( event.keyCode == 13 ) service_dialog_add_user() }">
+      <button data-dojo-type="dijit/form/Button" type="button">Add User
+        <script type="dojo/on" data-dojo-event="click">
+          service_dialog_add_user();
+        </script>
+      </button>
+      <button data-dojo-type="dijit/form/Button" type="button">Remove Selected
+        <script type="dojo/on" data-dojo-event="click">
+          service_dialog_remove_users();
+        </script>
+      </button>
+    </div>
+  
+    <div class="formitem" id="service_dialog_monthly_charge_formitem">
+      <label for="service_dialog_monthly_charge_override">Monthly Charge</label>
+      <span id="service_dialog_monthly_charge_display">$0.00</span>
+      <input name="service_dialog_monthly_charge_override"
+             id="service_dialog_monthly_charge_overrideInput"
+             onchange="service_dialog_handle_change"
+             data-dojo-type="dijit/form/CurrencyTextBox"
+             data-dojo-props="currency:'USD'">
+      <input name="service_dialog_monthly_charge_override_toggle"
+             data-dojo-id="service_dialog_monthly_charge_override_toggle"
+             data-dojo-type="dijit/form/CheckBox"
+             onchange="service_dialog_enable_charge_override('monthly',this.checked)"> <label for="service_dialog_monthly_charge_override_toggle">override</label>
+    </div>
+  
+    <div class="formitem" id="service_dialog_setup_charge_formitem">
+      <label for="service_dialog_setup_charge_override">Setup Charge</label>
+      <span id="service_dialog_setup_charge_display">$0.00</span>
+      <input name="service_dialog_setup_charge_override"
+             id="service_dialog_setup_charge_overrideInput"
+             onchange="service_dialog_handle_change"
+             data-dojo-type="dijit/form/CurrencyTextBox"
+             data-dojo-props="currency:'USD'">
+      <input name="service_dialog_setup_charge_override_toggle"
+             data-dojo-id="service_dialog_setup_charge_override_toggle"
+             data-dojo-type="dijit/form/CheckBox"
+             onchange="service_dialog_enable_charge_override('setup',this.checked)"> <label for="service_dialog_setup_charge_override_toggle">override</label>
+    </div>
+  
+    <div class="button-area">
+      <button id="service_dialog_submitButton" data-dojo-type="dijit/form/Button" type="button">FILLED IN BY openAddServiceDialog(...)
+        <script type="dojo/on" data-dojo-event="click">
+          service_dialog_submit();
+        </script>
+      </button>
+    </div>
+
+  </div>
+
+</div>
+
+</div>
+<!-- end service_dialog -->
